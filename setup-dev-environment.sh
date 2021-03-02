@@ -40,7 +40,7 @@ Icon=sqldeveloper_icon.png
 Terminal=false
 Type=Application
 Categories=Application
-EOT 
+EOT
 chmod +x ~/.local/share/applications/sqldeveloper.desktop
 
 # Install Slack

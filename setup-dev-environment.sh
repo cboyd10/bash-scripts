@@ -28,6 +28,7 @@ sudo unzip sqldeveloper-*-no-jre.zip -d /opt/
 sudo chmod +x /opt/sqldeveloper/sqldeveloper.sh
 
 # Set up SQL Developer Launcher
+mkdir -p ~/.local/share/icons/hicolor/128x128/apps
 cp sqldeveloper_icon.png ~/.local/share/icons/hicolor/128x128/apps/sqldeveloper_icon.png
 cat > ~/.local/share/applications/sqldeveloper.desktop << EOT
 [Desktop Entry]

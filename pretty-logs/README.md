@@ -36,9 +36,8 @@ The script checks for these dependencies and provides install tips if missing.
 ### 1. Save the script
 
 Create the file (no extension recommended):
-```
-bash
-nano pretty-logs
+```bash
+vim pretty-logs
 # Paste the full script content
 # Save and exit
 ```
@@ -54,8 +53,7 @@ nano pretty-logs
 ---
 
 ## Usage
-```
-bash
+```bash
 pretty-logs -p <pod> [-c <container>] [options...]
 ```
 ### Options
@@ -96,8 +94,7 @@ You can set these environment variables to override defaults permanently.
 ## Examples
 
 **Basic Tailing (Last 10 lines)**
-```
-bash
+```bash
 pretty-logs -p canvas-banner-batch
 ```
 **Tail 50 Lines**

@@ -1,0 +1,601 @@
+#!/usr/bin/env bash
+# pretty-logs — Colorized, human-readable Kubernetes/OpenShift pod logs with optional filtering via oc/kubectl and jq.
+# Includes Bash completion with: failure hints (no-space sentinels), timeout, and short-lived cache.
+
+# Robust shell options (guard pipefail outside Bash)
+set -eu
+if [ -n "${BASH_VERSION:-}" ]; then
+  set -o pipefail
+fi
+
+# -------------------------------------------------------------------
+# Help / Argument parsing (runs before dependency checks)
+# -------------------------------------------------------------------
+
+POD=""
+CONTAINER=""
+LEVELS="ERROR,WARN,INFO,DEBUG,TRACE"
+COLOR_MODE="${COLOR_MODE:-auto}"        # can be overridden via env or flag
+OC_OR_KUBECTL="${OC_OR_KUBECTL:-}"      # auto-detected later if not provided
+SCRIPT_NAME="$(basename "$0")"
+OP_MODE="run"                            # run | print-completion | install-completion | diag-completion
+INSTALL_SCOPE="user"                     # user | system
+
+print_help() {
+  cat <<'EOF'
+pretty-logs — Colorized JSON log prettifier for oc/kubectl with jq
+
+Usage:
+  pretty-logs -p <pod> [-c <container>] [--levels L1,L2,...] [--color auto|on|off]
+  pretty-logs <pod> [container]           # positional fallback
+  pretty-logs -h | --help
+  pretty-logs --print-completion          # print bash completion function
+  pretty-logs --install-completion [user|system]
+  pretty-logs --diag-completion           # diagnose completion connectivity
+
+Options:
+  -p, --pod <name>          Pod name (required unless using positional)
+  -c, --container <name>    Container name (optional)
+      --levels <list>       Comma-separated levels to include (default: ERROR,WARN,INFO,DEBUG,TRACE)
+      --color <mode>        Color mode: auto (default), on, off
+  -h, --help                Show this help and exit
+      --print-completion    Print bash completion function to stdout
+      --install-completion  Install completion (default: user). Needs sudo for "system".
+      --diag-completion     Run completion diagnostics (auth/connectivity/context)
+
+Environment:
+  OC_OR_KUBECTL             Choose CLI: "oc" or "kubectl" (default: auto-detect, preferring oc)
+  COLOR_MODE                Color mode: auto|on|off (default: auto)
+  LEVELS                    Comma-separated levels (default: ERROR,WARN,INFO,DEBUG,TRACE)
+
+Description:
+  Streams pod logs, parses JSON lines, and outputs:
+    - [LEVEL] colored by severity (ERROR:red, WARN:yellow, INFO:green, DEBUG:blue, TRACE:magenta)
+    - message in white
+    - all other fields (timestamp, env, service, logger) in light gray
+  Non-JSON lines are suppressed when filtering is active; otherwise they pass through.
+
+Auto-Completion:
+  - Tab-completes pod names, container names, and flags.
+  - If cluster is unreachable or not logged in, completion returns a **no-space sentinel hint** so it always appears:
+        __NO_PODS__cluster_unreachable_or_not_logged_in
+    and for containers:
+        __NO_CONTAINERS__cannot_fetch_pod_or_cluster_unreachable
+  - Uses a 1-second timeout (Linux: timeout; macOS: gtimeout if installed).
+  - Caches results for 10 seconds to keep completion fast.
+
+Examples:
+  pretty-logs -p canvas-banner-batch
+  pretty-logs -p canvas-banner-batch -c processor --levels WARN,ERROR
+  COLOR_MODE=on pretty-logs -p canvas-banner-batch | less -R
+  pretty-logs canvas-banner-batch processor
+
+Notes:
+  - Requires jq and either oc or kubectl (script checks and prints install tips).
+  - For system-wide completion install, ensure this script is on root's PATH (e.g., /usr/local/bin).
+EOF
+}
+
+# Long flag shim → short flags / direct vars
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help)             args+=(-h); shift ;;
+    --pod)              args+=(-p); shift; args+=("${1:-}"); shift ;;
+    --container)        args+=(-c); shift; args+=("${1:-}"); shift ;;
+    --levels)           shift; LEVELS="${1:-$LEVELS}"; shift ;;
+    --color)            shift; COLOR_MODE="${1:-auto}"; shift ;;
+    --print-completion) OP_MODE="print-completion"; shift ;;
+    --install-completion)
+      OP_MODE="install-completion"; shift
+      if [[ "${1:-}" == "user" || "${1:-}" == "system" ]]; then
+        INSTALL_SCOPE="$1"; shift
+      fi
+      ;;
+    --diag-completion)  OP_MODE="diag-completion"; shift ;;
+    --*)                echo "Unknown option: $1" >&2; exit 1 ;;
+    *)                  args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]}"
+
+# Parse short options (pod/container/help)
+while getopts ":hp:c:" opt; do
+  case "$opt" in
+    h) print_help; exit 0 ;;
+    p) POD="$OPTARG" ;;
+    c) CONTAINER="$OPTARG" ;;
+    \?) echo "Unknown option: -$OPTARG" >&2; print_help; exit 1 ;;
+    :)  echo "Missing value for -$OPTARG" >&2; print_help; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# Positional fallback: <pod> [container]
+if [[ -z "${POD}" && "$OP_MODE" == "run" ]]; then
+  POD="${1:-}"
+  if [[ -n "${2:-}" ]]; then
+    CONTAINER="${CONTAINER:-$2}"
+  fi
+fi
+
+# If user asked for help via positional first arg
+if [[ "${POD:-}" == "-h" || "${POD:-}" == "--help" ]]; then
+  print_help
+  exit 0
+fi
+
+# -------------------------------------------------------------------
+# Completion function + installers
+# -------------------------------------------------------------------
+
+_print_completion() {
+  cat <<'COMP'
+# bash completion for pretty-logs (enhanced: timeout + cache + no-space hints)
+_pretty_logs_complete() {
+  COMPREPLY=()
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  # Detect CLI
+  local cli="${OC_OR_KUBECTL:-}"
+  if [[ -z "$cli" ]]; then
+    if command -v oc >/dev/null 2>&1; then cli="oc"
+    elif command -v kubectl >/dev/null 2>&1; then cli="kubectl"
+    else
+      # No CLI: print and return a no-space hint
+      printf '\n%s\n' "NO_CLI: install oc or kubectl" >&2
+      COMPREPLY=( $(compgen -W "__NO_CLI__install_oc_or_kubectl" -- "") )
+      return 0
+    fi
+  fi
+
+  # Timeout (Linux: timeout; macOS: gtimeout if installed)
+  _run_with_timeout() {
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 1 "$cli" "$@" 2>/dev/null
+    elif command -v gtimeout >/dev/null 2>&1; then
+      gtimeout 1 "$cli" "$@" 2>/dev/null
+    else
+      "$cli" "$@" 2>/dev/null
+    fi
+  }
+  _now() { date +%s; }
+
+  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/pretty-logs"
+  local pods_cache="${cache_dir}/pods.list"
+  local pods_cache_ts="${cache_dir}/pods.ts"
+  local containers_cache_prefix="${cache_dir}/containers." # containers.<pod>.list + .ts
+  local ttl=10
+
+  _ensure_cache_dir() { mkdir -p "$cache_dir" 2>/dev/null || true; }
+  _cache_fresh() {
+    local tsfile="$1"
+    [[ -f "$tsfile" ]] || return 1
+    local ts now
+    ts="$(cat "$tsfile" 2>/dev/null || echo 0)"
+    now="$(_now)"
+    (( now - ts < ttl ))
+  }
+  _write_cache() {
+    local listfile="$1"; shift
+    local tsfile="$1"; shift
+    _ensure_cache_dir
+    printf "%s\n" "$@" > "$listfile"
+    printf "%s\n" "$(_now)" > "$tsfile"
+  }
+
+  # List pods (with cache + failure indicator)
+  _list_pods() {
+    if _cache_fresh "$pods_cache_ts"; then
+      cat "$pods_cache" 2>/dev/null
+      return 0
+    fi
+    local out
+    out="$(_run_with_timeout get pods --no-headers | awk '{print $1}')"
+    if [[ -n "$out" ]]; then
+      _write_cache "$pods_cache" "$pods_cache_ts" $out
+      printf "%s\n" "$out"
+      return 0
+    fi
+    printf '%s\n' "<no pods — cluster unreachable or not logged in>"
+    return 0
+  }
+
+  # Extract selected pod from args (supports -p/--pod or positional)
+  _get_selected_pod() {
+    local i
+    for ((i=1; i<${#COMP_WORDS[@]}; i++)); do
+      case "${COMP_WORDS[i]}" in
+        -p|--pod) echo "${COMP_WORDS[i+1]}"; return 0 ;;
+      esac
+    done
+    for ((i=1; i<${#COMP_WORDS[@]}; i++)); do
+      [[ "${COMP_WORDS[i]}" == -* ]] && continue
+      echo "${COMP_WORDS[i]}"; return 0
+    done
+    echo ""
+  }
+
+  # List containers for a pod (with cache + failure indicator)
+  _list_containers() {
+    local pod="$1"
+    [[ -z "$pod" ]] && return 0
+    local listfile="${containers_cache_prefix}${pod}.list"
+    local tsfile="${containers_cache_prefix}${pod}.ts"
+    if _cache_fresh "$tsfile"; then
+      cat "$listfile" 2>/dev/null
+      return 0
+    fi
+    local out
+    out="$(_run_with_timeout get pod "$pod" -o jsonpath='{range .spec.containers[*]}{.name}{"\n"}{end}')"
+    if [[ -n "$out" ]]; then
+      _write_cache "$listfile" "$tsfile" $out
+      printf "%s\n" "$out"
+      return 0
+    fi
+    printf '%s\n' "<no containers — cannot fetch pod or cluster unreachable>"
+    return 0
+  }
+
+  # Flags & value suggestions
+  local longflags="--help --pod --container --levels --color --print-completion --install-completion --diag-completion"
+  local shortflags="-h -p -c"
+  local colorvals="auto on off"
+  local levelvals="TRACE DEBUG INFO WARN ERROR"
+
+  if [[ "$cur" == -* ]]; then
+    COMPREPLY=( $(compgen -W "$shortflags $longflags" -- "$cur") )
+    return 0
+  fi
+
+  # Non-flag words
+  local nonflags=()
+  local i
+  for ((i=1; i<${#COMP_WORDS[@]}; i++)); do
+    [[ "${COMP_WORDS[i]}" == -* ]] && continue
+    nonflags+=("${COMP_WORDS[i]}")
+  done
+
+  case "$prev" in
+    -p|--pod)
+      local pods="$(_list_pods)"
+      if [[ -n "$pods" && "$pods" != "<no pods — cluster unreachable or not logged in>" ]]; then
+        COMPREPLY=( $(compgen -W "$pods" -- "$cur") )
+      else
+        # Diagnostic print + no-space sentinel candidate (ensures visibility)
+        printf '\n%s\n' "NO_PODS: cluster unreachable or not logged in" >&2
+        COMPREPLY=( $(compgen -W "__NO_PODS__cluster_unreachable_or_not_logged_in" -- "") )
+      fi
+      return 0
+      ;;
+    -c|--container)
+      local pod="$(_get_selected_pod)"
+      if [[ -n "$pod" ]]; then
+        local cons="$(_list_containers "$pod")"
+        if [[ -n "$cons" && "$cons" != "<no containers — cannot fetch pod or cluster unreachable>" ]]; then
+          COMPREPLY=( $(compgen -W "$cons" -- "$cur") )
+        else
+          printf '\n%s\n' "NO_CONTAINERS: cannot fetch pod or cluster unreachable" >&2
+          COMPREPLY=( $(compgen -W "__NO_CONTAINERS__cannot_fetch_pod_or_cluster_unreachable" -- "") )
+        fi
+      fi
+      return 0
+      ;;
+  esac
+
+  # Positional completion (first token = pod, second token = container)
+  if (( ${#nonflags[@]} == 0 )) || { (( ${#nonflags[@]} == 1 )) && [[ "$cur" == "${nonflags[0]}" ]]; }; then
+    local pods="$(_list_pods)"
+    if [[ -n "$pods" && "$pods" != "<no pods — cluster unreachable or not logged in>" ]]; then
+      COMPREPLY=( $(compgen -W "$pods" -- "$cur") )
+    else
+      printf '\n%s\n' "NO_PODS: cluster unreachable or not logged in" >&2
+      COMPREPLY=( $(compgen -W "__NO_PODS__cluster_unreachable_or_not_logged_in" -- "") )
+    fi
+    return 0
+  else
+    local pod="${nonflags[0]}"
+    local cons="$(_list_containers "$pod")"
+    if [[ -n "$cons" && "$cons" != "<no containers — cannot fetch pod or cluster unreachable>" ]]; then
+      COMPREPLY=( $(compgen -W "$cons" -- "$cur") )
+    else
+      printf '\n%s\n' "NO_CONTAINERS: cannot fetch pod or cluster unreachable" >&2
+      COMPREPLY=( $(compgen -W "__NO_CONTAINERS__cannot_fetch_pod_or_cluster_unreachable" -- "") )
+    fi
+    return 0
+  fi
+}
+
+# Register completion for the command name (ensure the script is installed under this name)
+complete -F _pretty_logs_complete pretty-logs
+COMP
+}
+
+_install_completion() {
+  local scope="${1:-user}"
+  local target_cmd="pretty-logs"  # command name for completion registration
+  local content
+  content="$(_print_completion | sed "s/pretty-logs/$target_cmd/g")"
+
+  # Detect OS and choose destination directory
+  local os="$(uname -s)"
+  local dest_dir=""
+  local dest_file=""
+
+  if [[ "$scope" == "system" ]]; then
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+      echo "❌ System install requires sudo. Try: sudo $0 --install-completion system" >&2
+      exit 1
+    fi
+    case "$os" in
+      Linux)
+        dest_dir="/etc/bash_completion.d"
+        ;;
+      Darwin)
+        if [[ -d "/opt/homebrew/etc/bash_completion.d" ]]; then
+          dest_dir="/opt/homebrew/etc/bash_completion.d"
+        elif [[ -d "/usr/local/etc/bash_completion.d" ]]; then
+          dest_dir="/usr/local/etc/bash_completion.d"
+        else
+          dest_dir="/etc/bash_completion.d"
+          echo "⚠️ Homebrew bash-completion directory not found. Falling back to $dest_dir." >&2
+          echo "   Install bash-completion@2 and ensure it’s sourced in your shell startup." >&2
+        fi
+        ;;
+      *)
+        dest_dir="/etc/bash_completion.d"
+        ;;
+    esac
+
+    dest_file="${dest_dir}/${target_cmd}"
+    echo "🔧 Installing completion to: $dest_file"
+    mkdir -p "$dest_dir"
+    printf "%s\n" "$content" > "$dest_file"
+    echo "✅ Installed."
+    echo "➡️  Activate now in current shell:  source \"$dest_file\""
+
+  else
+    # User scope
+    dest_dir="${HOME}/.bash_completion.d"
+    dest_file="${dest_dir}/${target_cmd}"
+    mkdir -p "$dest_dir"
+    echo "🔧 Installing completion to: $dest_file"
+    printf "%s\n" "$content" > "$dest_file"
+    echo "✅ Installed."
+    echo "➡️  Activate now in current shell:  source \"$dest_file\""
+    if ! type _init_completion >/dev/null 2>&1; then
+      echo "ℹ️  bash-completion not detected. Enable it in your shell:"
+      echo "    macOS: brew install bash-completion@2 and source its profile script"
+      echo "    Linux:  sudo apt/dnf install bash-completion and source /etc/bash_completion"
+    fi
+  fi
+}
+
+# Handle completion/installer/diagnostics modes early (no dependency checks)
+case "$OP_MODE" in
+  print-completion) _print_completion; exit 0 ;;
+  install-completion) _install_completion "$INSTALL_SCOPE"; exit 0 ;;
+  diag-completion)
+    echo "🔎 Completion diagnostics:"
+    if command -v oc >/dev/null 2>&1; then
+      echo "• oc: found"
+    else
+      echo "• oc: NOT found"
+    fi
+    if command -v kubectl >/dev/null 2>&1; then
+      echo "• kubectl: found"
+    else
+      echo "• kubectl: NOT found"
+    fi
+    cli="${OC_OR_KUBECTL:-}"
+    if [[ -z "$cli" ]]; then
+      if command -v oc >/dev/null 2>&1; then cli="oc"
+      elif command -v kubectl >/dev/null 2>&1; then cli="kubectl"
+      fi
+    fi
+    if [[ -z "$cli" ]]; then
+      echo "❌ No cluster CLI detected — completion cannot query pods/containers."
+      exit 2
+    else
+      echo "• Using CLI: $cli"
+    fi
+    echo "• Trying: $cli get pods --no-headers"
+    if "$cli" get pods --no-headers >/dev/null 2>&1; then
+      echo "✅ OK — CLI can list pods in current context/namespace."
+    else
+      echo "❌ Failed to list pods. Possible causes:"
+      echo "   - Not logged in (oc login / kubectl context)"
+      echo "   - Wrong kube context/namespace"
+      echo "   - Network or cluster unreachable"
+      echo "   - Insufficient RBAC to list pods"
+      echo "• Try:"
+      echo "   $cli whoami        # OpenShift login check (oc)"
+      echo "   $cli cluster-info  # Kubernetes connectivity"
+      echo "   $cli config get-contexts"
+      exit 3
+    fi
+    exit 0
+    ;;
+  run) : ;;
+esac
+
+# Validate required pod (before preflight)
+if [[ -z "$POD" ]]; then
+  echo "❌ Pod name is required." >&2
+  echo
+  print_help
+  exit 1
+fi
+
+# -------------------------------------------------------------------
+# Preflight: check dependencies (oc/kubectl and jq)
+# -------------------------------------------------------------------
+
+detect_os() {
+  local os="$(uname -s)"
+  case "$os" in
+    Linux)   echo "linux" ;;
+    Darwin)  echo "macos" ;;
+    CYGWIN*|MINGW*|MSYS*) echo "windows" ;;
+    *)       echo "unknown" ;;
+  esac
+}
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+print_install_hints() {
+  local os="$1"
+  local need_oc="$2"     # "yes" or "no"
+  local need_kubectl="$3"
+  local need_jq="$4"
+
+  echo
+  echo "🔧 Installation hints:"
+  case "$os" in
+    macos)
+      [[ "$need_oc" == "yes" ]]      && echo "  - oc (OpenShift CLI):   brew install openshift-cli"
+      [[ "$need_kubectl" == "yes" ]] && echo "  - kubectl (K8s CLI):    brew install kubectl"
+      [[ "$need_jq" == "yes" ]]      && echo "  - jq (JSON processor):  brew install jq"
+      ;;
+    linux)
+      [[ "$need_oc" == "yes" ]]      && echo "  - oc (OpenShift CLI):   Download from https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/ (extract and place 'oc' on PATH)"
+      [[ "$need_kubectl" == "yes" ]] && echo "  - kubectl (K8s CLI):    Debian/Ubuntu: sudo apt-get install -y kubectl | RHEL/CentOS: sudo dnf install -y kubectl"
+      [[ "$need_jq" == "yes" ]]      && echo "  - jq (JSON processor):  Debian/Ubuntu: sudo apt-get install -y jq | RHEL/CentOS: sudo dnf install -y jq"
+      ;;
+    windows)
+      [[ "$need_oc" == "yes" ]]      && echo "  - oc (OpenShift CLI):   Download ZIP from https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/ and add folder to PATH"
+      [[ "$need_kubectl" == "yes" ]] && echo "  - kubectl (K8s CLI):    winget install Kubernetes.kubectl"
+      [[ "$need_jq" == "yes" ]]      && echo "  - jq (JSON processor):  winget install jqlang.jq"
+      ;;
+    *)
+      [[ "$need_oc" == "yes" ]]      && echo "  - oc (OpenShift CLI):   https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/"
+      [[ "$need_kubectl" == "yes" ]] && echo "  - kubectl (K8s CLI):    https://kubernetes.io/docs/tasks/tools/"
+      [[ "$need_jq" == "yes" ]]      && echo "  - jq (JSON processor):  https://jqlang.github.io/jq/"
+      ;;
+  esac
+
+  echo
+  echo "After installing, ensure the binaries are on your PATH (e.g., re-open your terminal)."
+}
+
+# Determine which cluster CLI to use (prefer oc if present)
+choose_cli() {
+  if [[ -n "${OC_OR_KUBECTL:-}" ]]; then
+    echo "$OC_OR_KUBECTL"
+  elif has_cmd oc; then
+    echo "oc"
+  elif has_cmd kubectl; then
+    echo "kubectl"
+  else
+    echo ""
+  fi
+}
+
+OS="$(detect_os)"
+CLI_BIN="$(choose_cli)"
+
+NEED_OC="no"
+NEED_KUBECTL="no"
+NEED_JQ="no"
+
+if [[ -z "$CLI_BIN" ]]; then
+  NEED_OC="yes"
+  NEED_KUBECTL="yes"
+fi
+
+if ! has_cmd jq; then
+  NEED_JQ="yes"
+fi
+
+if [[ "$NEED_OC" == "yes" || "$NEED_KUBECTL" == "yes" || "$NEED_JQ" == "yes" ]]; then
+  echo "❌ Missing required tools:"
+  [[ "$NEED_OC" == "yes" ]]      && echo "  - oc (OpenShift CLI) not found"
+  [[ "$NEED_KUBECTL" == "yes" ]] && echo "  - kubectl (Kubernetes CLI) not found"
+  [[ "$NEED_JQ" == "yes" ]]      && echo "  - jq (JSON processor) not found"
+  print_install_hints "$OS" "$NEED_OC" "$NEED_KUBECTL" "$NEED_JQ"
+  exit 127
+fi
+
+# Export the selected CLI to use downstream (override allowed via OC_OR_KUBECTL)
+OC_OR_KUBECTL="${OC_OR_KUBECTL:-$CLI_BIN}"
+
+# Optional: show versions for transparency (non-fatal if unavailable)
+echo "✅ Using CLI: $OC_OR_KUBECTL"
+$OC_OR_KUBECTL version --client 2>/dev/null || true
+echo "✅ jq version:"
+jq --version
+
+# -------------------------------------------------------------------
+# Color mode resolve (auto → on/off depending on TTY)
+# -------------------------------------------------------------------
+
+if [[ "$COLOR_MODE" == "auto" ]]; then
+  if [[ -t 1 ]]; then COLOR_MODE="on"; else COLOR_MODE="off"; fi
+fi
+
+# -------------------------------------------------------------------
+# Build and run logs command
+# -------------------------------------------------------------------
+
+LOG_CMD=("$OC_OR_KUBECTL" logs -f --tail=10 "$POD")
+[[ -n "${CONTAINER}" ]] && LOG_CMD+=(-c "$CONTAINER")
+
+"${LOG_CMD[@]}" | jq -Rr --unbuffered --arg color "$COLOR_MODE" --arg levels "$LEVELS" '
+# ANSI escape codes
+def esc: "\u001b[";
+def reset: esc + "0m";
+def red: esc + "31m";
+def green: esc + "32m";
+def yellow: esc + "33m";
+def blue: esc + "34m";
+def magenta: esc + "35m";
+def white: esc + "37m";
+def lightGray: esc + "90m";
+
+# Switch off colors if $color == "off"
+def maybe(c): if $color == "on" then c else "" end;
+
+def level_color(l):
+  (l | ascii_upcase) as $L
+  | if   $L == "ERROR" then maybe(red)
+    elif $L == "WARN"  then maybe(yellow)
+    elif $L == "INFO"  then maybe(green)
+    elif $L == "DEBUG" then maybe(blue)
+    elif $L == "TRACE" then maybe(magenta)
+    else maybe(white)
+    end;
+
+# Format: context in light gray, [LEVEL] colored, message white
+def fmt(o):
+  o as $o |
+  ($o["@timestamp"] // $o.timestamp // "-") as $ts |
+  ($o.log.level // $o.level // "-") as $level |
+  ($o.log.logger // $o.logger // "") as $logger |
+  ($o.process.thread.name // $o.thread // "") as $thread |
+  ($o.service.name // "-") as $svc |
+  ($o.service.environment // "") as $env |
+  ($o.service.version // "") as $version |
+  ($o.transaction.id // "") as $tx |
+  ($o.trace.id // "") as $trace |
+  ($o.message // $o.msg // "") as $msg |
+  (level_color($level)) as $lc |
+  # "\(lightGray)\($ts) | \($env) | \($svc) | \($version) | [\($lc)\($level)\(reset)\(lightGray)] | \($logger) (\($thread)) tx=\($tx) trace=\($trace) - \(reset)\(white)\($msg)\(reset)";
+  "\(lightGray)\($ts) | \($env) | \($svc) | \($version) | [\($lc)\($level)\(reset)\(lightGray)] | \($logger) - \(reset)\(white)\($msg)\(reset)";
+
+# Allowlist from comma-separated $levels
+def in_levels(l):
+  ( ($levels // "") | split(",") | map(ascii_upcase) ) as $Ls
+  | (l|ascii_upcase) as $L
+  | ($Ls | index($L)) != null;
+
+. as $line
+| (fromjson? // null) as $o
+| if $o == null then empty            # drop raw/non-JSON when filtering
+  else if in_levels($o.log.level // $o.level // "")
+       then fmt($o)
+       else empty
+       end
+  end
+'

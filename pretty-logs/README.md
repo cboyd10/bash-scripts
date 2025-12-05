@@ -6,318 +6,161 @@ Colorized, human-readable Kubernetes/OpenShift pod logs with optional filtering�
 
 ## Features
 
-- **Readable output**
-  - **[LEVEL]** is color-coded by severity (ERROR:red, WARN:yellow, INFO:green, DEBUG:blue, TRACE:magenta)
-  - **Message** in **white**
-  - **Context** (timestamp, environment, service, logger, etc.) in **light gray**
-- **Filtering**: include only selected levels via `LEVELS` (e.g., `WARN,ERROR`)
-- **Auto-completion (Bash)**:
-  - Tab-complete **pod names**, **container names**, and **flags**
-  - If the cluster is **unreachable** or you’re **not logged in**, completion **always shows a hint candidate** (no spaces, so it’s visible on all Bash versions):
-    ```
-    __NO_PODS__cluster_unreachable_or_not_logged_in
-    ```
-    and for containers:
-    ```
-    __NO_CONTAINERS__cannot_fetch_pod_or_cluster_unreachable
-    ```
-  - Adds a **1-second timeout** for completion calls  
-    (Linux `timeout`; macOS `gtimeout` if GNU coreutils installed)
-  - **Caches** results for 10 seconds to keep completion snappy
-- **Diagnostics**: `pretty-logs --diag-completion` checks auth/connectivity/context
-- **Preflight checks**: Friendly install hints if dependencies are missing
-- **Help**: `pretty-logs --help` shows usage, options, and examples
+| Feature | Description |
+| :--- | :--- |
+| **Readable Output** | JSON logs are parsed and color-coded. <br>• **[LEVEL]**: Colored by severity (ERROR:red, WARN:yellow, INFO:green, DEBUG:blue, TRACE:magenta)<br>• **Message**: White<br>• **Context**: Light gray (timestamp, environment, service, logger) |
+| **Filtering** | Include only selected levels via `LEVELS` (e.g., `WARN,ERROR`). |
+| **Log Tailing** | • Default: tails last 10 lines<br>• Customizable via `--tail <n>`<br>• Fetch all logs via `--all` |
+| **Auto-completion** | Tab-complete pod names, container names, and flags. <br>• **Smart Hints**: If cluster is unreachable, shows explicit `__NO_PODS__` hints.<br>• **Fast**: Caches results for 10s and uses a 1s timeout. |
+| **Diagnostics** | Run `pretty-logs --diag-completion` to check auth & connectivity. |
+| **Preflight Checks** | Friendly install hints if dependencies (`jq`, `oc`/`kubectl`) are missing. |
 
 ---
 
 ## Requirements
 
-- **One of:**
-  - OpenShift CLI: `oc`
-  - Kubernetes CLI: `kubectl`
-- **`jq`** (JSON processor)
-- **bash-completion** (optional but recommended for tab completion)
+The script checks for these dependencies and provides install tips if missing.
 
-The script checks for these and prints OS-specific install tips if anything is missing.
+*   **Cluster CLI** (one of):
+    *   `oc` (OpenShift CLI)
+    *   `kubectl` (Kubernetes CLI)
+*   **JSON Processor**:
+    *   `jq`
+*   **Bash Completion** (Optional):
+    *   `bash-completion` package (recommended for tab completion)
 
 ---
 
 ## Installation
 
-### 1) Save the script
+### 1. Save the script
 
-Create a file named `pretty-logs` (no `.sh` extension recommended):
-
-```bash
+Create the file (no extension recommended):
+```
+bash
 nano pretty-logs
 # Paste the full script content
-# Save and exit (Ctrl+O, Enter, Ctrl+X)
-````
-
-> Important: The first line **must** be exactly:
->
-> ```bash
-> #!/usr/bin/env bash
-> ```
->
-> If you edited on Windows, convert line endings to Unix (LF) before running:
->
-> ```bash
-> dos2unix pretty-logs
-> ```
-
-### 2) Make it executable and put it on your PATH
-
-**User install:**
-
-```bash
-mkdir -p "$HOME/bin"
-mv pretty-logs "$HOME/bin/pretty-logs"
-chmod +x "$HOME/bin/pretty-logs"
+# Save and exit
 ```
+> **Note**: First line must be `#!/usr/bin/env bash`. If editing on Windows, convert line endings with `dos2unix pretty-logs`.
 
-Ensure `$HOME/bin` is on your PATH:
+### 2. Install to PATH
 
-```bash
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+| Scope | Commands |
+| :--- | :--- |
+| **User** | `mkdir -p ~/bin`<br>`mv pretty-logs ~/bin/`<br>`chmod +x ~/bin/pretty-logs`<br>*(Ensure `~/bin` is in your `$PATH`)* |
+| **System** | `sudo mv pretty-logs /usr/local/bin/`<br>`sudo chmod +x /usr/local/bin/pretty-logs` |
+
+---
+
+## Usage
 ```
-
-**System-wide (recommended so `sudo` can find it):**
-
-```bash
-sudo mv "$HOME/bin/pretty-logs" /usr/local/bin/pretty-logs
-sudo chmod +x /usr/local/bin/pretty-logs
+bash
+pretty-logs -p <pod> [-c <container>] [options...]
 ```
+### Options
 
-Verify:
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `-p`, `--pod <name>` | Pod name (**required** unless positional). | |
+| `-c`, `--container <name>` | Container name. | First container |
+| `--levels <list>` | Comma-separated levels to include. | `ERROR,WARN,INFO,DEBUG,TRACE` |
+| `--tail <n>` | Number of lines to show from the end. | `10` |
+| `--all` | Show all logs (disables tailing). | `false` |
+| `--color <mode>` | Color mode: `auto`, `on`, `off`. | `auto` |
+| `-h`, `--help` | Show help message. | |
 
-```bash
-which pretty-logs
-pretty-logs --help
+### Advanced Commands
+
+| Command | Description |
+| :--- | :--- |
+| `--print-completion` | Print the raw bash completion script to stdout. |
+| `--install-completion [scope]` | Install completion script. Scope: `user` (default) or `system`. |
+| `--diag-completion` | Diagnose completion connectivity & auth issues. |
+
+---
+
+## Configuration (Environment Variables)
+
+You can set these environment variables to override defaults permanently.
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `LEVELS` | Default log levels to filter. | `ERROR,WARN,INFO,DEBUG,TRACE` |
+| `TAIL_LINES` | Default number of lines to tail. | `10` |
+| `COLOR_MODE` | Color output mode. | `auto` |
+| `OC_OR_KUBECTL` | Force specific CLI (`oc` or `kubectl`). | Auto-detect (prefers `oc`) |
+
+---
+
+## Examples
+
+**Basic Tailing (Last 10 lines)**
 ```
-
-***
-
-## Getting Started
-
-Run the script with a pod name (container optional):
-
-```bash
-pretty-logs -p my-pod
-pretty-logs my-pod my-container
-```
-
-***
-
-## Auto-Completion
-
-The script includes built-in **Bash completion** for pods, containers, and flags.
-
-### Enable bash-completion
-
-**macOS (Homebrew):**
-
-```bash
-brew install bash-completion@2
-echo '[[ -r "/opt/homebrew/etc/profile.d/bash_completion.sh" ]] && . "/opt/homebrew/etc/profile.d/bash_completion.sh"' >> ~/.bash_profile
-source ~/.bash_profile
-```
-
-**Debian/Ubuntu:**
-
-```bash
-sudo apt-get install -y bash-completion
-echo '[[ -r /etc/bash_completion ]] && . /etc/bash_completion' >> ~/.bashrc
-source ~/.bashrc
-```
-
-**RHEL/CentOS/Fedora:**
-
-```bash
-sudo dnf install -y bash-completion
-echo '[[ -r /etc/bash_completion ]] && . /etc/bash_completion' >> ~/.bashrc
-source ~/.bashrc
-```
-
-### Install completion for `pretty-logs`
-
-**User-level:**
-
-```bash
-pretty-logs --install-completion
-source ~/.bash_completion.d/pretty-logs
-```
-
-**System-wide** (ensure `pretty-logs` is in `/usr/local/bin` so root can find it):
-
-```bash
-sudo pretty-logs --install-completion system
-# Activate now:
-source /etc/bash_completion.d/pretty-logs \
-  || source /opt/homebrew/etc/bash_completion.d/pretty-logs \
-  || source /usr/local/etc/bash_completion.d/pretty-logs
-```
-
-### Verify completion
-
-*   Pod names:
-    ```bash
-    pretty-logs -p <TAB><TAB>
-    ```
-*   Container names (after selecting a pod):
-    ```bash
-    pretty-logs -p mypod -c <TAB><TAB>
-    ```
-*   Flags:
-    ```bash
-    pretty-logs --<TAB><TAB>
-    ```
-
-If the cluster is unreachable or you’re not logged in, you will see one of:
-
-    __NO_PODS__cluster_unreachable_or_not_logged_in
-    __NO_CONTAINERS__cannot_fetch_pod_or_cluster_unreachable
-
-> Tip: Improve completion UX with Readline settings:
->
-> ```bash
-> printf '%s\n' \
-> 'set show-all-if-ambiguous on' \
-> 'set page-completions off' \
-> 'set completion-ignore-case on' \
-> 'set bell-style none' >> ~/.inputrc
-> bind -f ~/.inputrc
-> ```
-
-***
-
-## Usage Examples
-
-```bash
-# Follow logs with color (auto on TTY)
+bash
 pretty-logs -p canvas-banner-batch
+```
+**Tail 50 Lines**
+```bash
+pretty-logs -p canvas-banner-batch --tail 50
+```
 
-# Specific container
-pretty-logs -p canvas-banner-batch -c processor
+**Show All Logs**
+```bash
+pretty-logs -p canvas-banner-batch --all
+```
 
-# Filter to WARN and ERROR only
-pretty-logs -p canvas-banner-batch --levels WARN,ERROR
+**Specific Container & Filter Levels**
+```bash
+pretty-logs -p canvas-banner-batch -c processor --levels WARN,ERROR
+```
 
-# Force color when piping to less (use -R to preserve ANSI colors)
+**Pipe to Less (Preserve Colors)**
+```bash
 COLOR_MODE=on pretty-logs -p canvas-banner-batch | less -R
 ```
 
-***
+---
 
-## Command Reference
+## Auto-Completion Setup
 
-*   **Help**:
-    ```bash
-    pretty-logs --help
-    ```
+### 1. Enable bash-completion
+Ensure your OS has bash-completion installed and sourced.
 
-*   **Print completion script**:
-    ```bash
-    pretty-logs --print-completion
-    ```
+*   **macOS**: `brew install bash-completion@2`
+*   **Linux**: `sudo apt install bash-completion` or `sudo dnf install bash-completion`
 
-*   **Install completion**:
-    ```bash
-    pretty-logs --install-completion            # user-level
-    sudo pretty-logs --install-completion system  # system-wide
-    ```
+### 2. Install Script Completion
 
-*   **Diagnose completion connectivity**:
-    ```bash
-    pretty-logs --diag-completion
-    ```
+| Scope | Command |
+| :--- | :--- |
+| **User** | `pretty-logs --install-completion`<br>`source ~/.bash_completion.d/pretty-logs` |
+| **System** | `sudo pretty-logs --install-completion system`<br>`source /etc/bash_completion.d/pretty-logs` |
 
-***
+### 3. Verification
+Type `pretty-logs -p <TAB>` to see pod suggestions.
 
-## Configuration
-
-*   **Pod name**: `-p`, `--pod`, or positional first argument
-*   **Container name**: `-c`, `--container`, or positional second argument
-*   **Levels filter**: `--levels` or `LEVELS=...`  
-    Default: `ERROR,WARN,INFO,DEBUG,TRACE`
-*   **Color mode**: `--color` or `COLOR_MODE=auto|on|off`  
-    Default: `auto` (colors on TTY; off in pipes/files)
-*   **CLI override**: `OC_OR_KUBECTL=oc|kubectl`  
-    Default: auto-detect (prefers `oc` if available)
-
-***
+---
 
 ## Troubleshooting
 
-*   **Command not found**:
-    ```bash
-    which pretty-logs
-    chmod +x /path/to/pretty-logs
-    echo 'export PATH="/path/to:$PATH"' >> ~/.bashrc && source ~/.bashrc
-    ```
-    For system use, install to `/usr/local/bin/pretty-logs`.
+| Issue | Solution |
+| :--- | :--- |
+| **Command not found** | Check if `pretty-logs` is in a directory included in your `$PATH`. |
+| **No Colors** | If piping, force colors: `COLOR_MODE=on pretty-logs ... | less -R`. |
+| **Completion Fails** | Run `pretty-logs --diag-completion` to check cluster connectivity. |
+| **"Illegal option -o pipefail"** | Ensure you run with `bash`, not `sh`. |
 
-*   **“Illegal option -o pipefail”**:
-    Ensure the script runs under Bash (not `sh`), and the shebang is the **first line**:
-    ```bash
-    #!/usr/bin/env bash
-    ```
-    Or run explicitly:
-    ```bash
-    bash /usr/local/bin/pretty-logs --help
-    ```
-
-*   **Completion hints don’t show**:
-    *   Confirm bash-completion is enabled:
-        ```bash
-        type _init_completion >/dev/null 2>&1 || echo "bash-completion not loaded"
-        ```
-    *   Re-source completion file:
-        ```bash
-        source ~/.bash_completion.d/pretty-logs
-        ```
-    *   Press `<TAB><TAB>` to display candidates.  
-        Unreachable/not logged cases return **no-space sentinel** candidates:
-            __NO_PODS__cluster_unreachable_or_not_logged_in
-            __NO_CONTAINERS__cannot_fetch_pod_or_cluster_unreachable
-
-*   **Cluster connectivity/auth**:
-    *   OpenShift:
-        ```bash
-        oc login
-        oc whoami
-        ```
-    *   Kubernetes:
-        ```bash
-        kubectl cluster-info
-        kubectl config current-context
-        ```
-
-*   **No colors when piping**:
-    ```bash
-    COLOR_MODE=on pretty-logs -p mypod | less -R
-    ```
-
-*   **Diagnose completion**:
-    ```bash
-    pretty-logs --diag-completion
-    ```
-
-***
+---
 
 ## Uninstall
 
+To remove the script and completion files:
+
 ```bash
-# Command
-rm -f /usr/local/bin/pretty-logs
-rm -f "$HOME/bin/pretty-logs"
+# Remove script
+rm -f /usr/local/bin/pretty-logs ~/bin/pretty-logs
 
-# Completion
-rm -f ~/.bash_completion.d/pretty-logs
-sudo rm -f /etc/bash_completion.d/pretty-logs
-sudo rm -f /opt/homebrew/etc/bash_completion.d/pretty-logs
-sudo rm -f /usr/local/etc/bash_completion.d/pretty-logs
+# Remove completion
+rm -f ~/.bash_completion.d/pretty-logs /etc/bash_completion.d/pretty-logs
 ```
-
-***

@@ -16,6 +16,8 @@ POD=""
 CONTAINER=""
 LEVELS="ERROR,WARN,INFO,DEBUG,TRACE"
 COLOR_MODE="${COLOR_MODE:-auto}"        # can be overridden via env or flag
+TAIL_LINES="${TAIL_LINES:-10}"          # default lines to tail
+ALL_LOGS="no"
 OC_OR_KUBECTL="${OC_OR_KUBECTL:-}"      # auto-detected later if not provided
 SCRIPT_NAME="$(basename "$0")"
 OP_MODE="run"                            # run | print-completion | install-completion | diag-completion
@@ -26,7 +28,7 @@ print_help() {
 pretty-logs — Colorized JSON log prettifier for oc/kubectl with jq
 
 Usage:
-  pretty-logs -p <pod> [-c <container>] [--levels L1,L2,...] [--color auto|on|off]
+  pretty-logs -p <pod> [-c <container>] [--levels L1,L2,...] [--tail <n>|--all] [--color auto|on|off]
   pretty-logs <pod> [container]           # positional fallback
   pretty-logs -h | --help
   pretty-logs --print-completion          # print bash completion function
@@ -37,6 +39,8 @@ Options:
   -p, --pod <name>          Pod name (required unless using positional)
   -c, --container <name>    Container name (optional)
       --levels <list>       Comma-separated levels to include (default: ERROR,WARN,INFO,DEBUG,TRACE)
+      --tail <n>            Number of lines to show from the end of the logs (default: 10)
+      --all                 Show all logs (disables --tail)
       --color <mode>        Color mode: auto (default), on, off
   -h, --help                Show this help and exit
       --print-completion    Print bash completion function to stdout
@@ -47,6 +51,7 @@ Environment:
   OC_OR_KUBECTL             Choose CLI: "oc" or "kubectl" (default: auto-detect, preferring oc)
   COLOR_MODE                Color mode: auto|on|off (default: auto)
   LEVELS                    Comma-separated levels (default: ERROR,WARN,INFO,DEBUG,TRACE)
+  TAIL_LINES                Number of lines to tail (default: 10)
 
 Description:
   Streams pod logs, parses JSON lines, and outputs:
@@ -84,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     --pod)              args+=(-p); shift; args+=("${1:-}"); shift ;;
     --container)        args+=(-c); shift; args+=("${1:-}"); shift ;;
     --levels)           shift; LEVELS="${1:-$LEVELS}"; shift ;;
+    --tail)             shift; TAIL_LINES="${1:-10}"; shift ;;
+    --all)              ALL_LOGS="yes"; shift ;;
     --color)            shift; COLOR_MODE="${1:-auto}"; shift ;;
     --print-completion) OP_MODE="print-completion"; shift ;;
     --install-completion)
@@ -240,7 +247,7 @@ _pretty_logs_complete() {
   }
 
   # Flags & value suggestions
-  local longflags="--help --pod --container --levels --color --print-completion --install-completion --diag-completion"
+  local longflags="--help --pod --container --levels --tail --all --color --print-completion --install-completion --diag-completion"
   local shortflags="-h -p -c"
   local colorvals="auto on off"
   local levelvals="TRACE DEBUG INFO WARN ERROR"
@@ -539,7 +546,12 @@ fi
 # Build and run logs command
 # -------------------------------------------------------------------
 
-LOG_CMD=("$OC_OR_KUBECTL" logs -f --tail=10 "$POD")
+if [[ "$ALL_LOGS" == "yes" ]]; then
+  LOG_CMD=("$OC_OR_KUBECTL" logs -f "$POD")
+else
+  LOG_CMD=("$OC_OR_KUBECTL" logs -f --tail="$TAIL_LINES" "$POD")
+fi
+
 [[ -n "${CONTAINER}" ]] && LOG_CMD+=(-c "$CONTAINER")
 
 "${LOG_CMD[@]}" | jq -Rr --unbuffered --arg color "$COLOR_MODE" --arg levels "$LEVELS" '
@@ -553,6 +565,7 @@ def blue: esc + "34m";
 def magenta: esc + "35m";
 def white: esc + "37m";
 def lightGray: esc + "90m";
+def cyan: esc + "38;5;30m";
 
 # Switch off colors if $color == "off"
 def maybe(c): if $color == "on" then c else "" end;
@@ -582,7 +595,7 @@ def fmt(o):
   ($o.message // $o.msg // "") as $msg |
   (level_color($level)) as $lc |
   # "\(lightGray)\($ts) | \($env) | \($svc) | \($version) | [\($lc)\($level)\(reset)\(lightGray)] | \($logger) (\($thread)) tx=\($tx) trace=\($trace) - \(reset)\(white)\($msg)\(reset)";
-  "\(lightGray)\($ts) | \($env) | \($svc) | \($version) | [\($lc)\($level)\(reset)\(lightGray)] | \($logger) - \(reset)\(white)\($msg)\(reset)";
+  "\(lightGray)\($ts) | \($env) | \($svc) | \($version) | \($lc)\($level)\(reset)\(lightGray) | \(reset)\(cyan)\($logger)\(reset)\(lightGray) : \(reset)\(white)\($msg)\(reset)";
 
 # Allowlist from comma-separated $levels
 def in_levels(l):

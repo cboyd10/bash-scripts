@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# BW_WRAPPER_SENTINEL — do not remove, used by install.sh to detect this wrapper
+set -euo pipefail
+
+BW_REAL_BINARY="__BW_REAL_BINARY__"
+BW_SESSION_FILE="${HOME}/.bw_session"
+
+# Commands that don't require an unlocked vault — passed through without prompting
+PASSTHROUGH_COMMANDS="status generate encode config update completion serve login"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+read_session_token() {
+  [[ -f "${BW_SESSION_FILE}" ]] || return 1
+  head -n1 "${BW_SESSION_FILE}"
+}
+
+write_session_token() {
+  local token="$1"
+  printf '%s\n%s\n' "${token}" "$(date +%s)" > "${BW_SESSION_FILE}"
+  chmod 600 "${BW_SESSION_FILE}"
+}
+
+delete_session_file() {
+  rm -f "${BW_SESSION_FILE}"
+}
+
+# Returns 0 if token is currently valid (vault unlocked), 1 otherwise.
+validate_token() {
+  local token="$1"
+  local status_output
+  status_output="$("${BW_REAL_BINARY}" status --session "${token}" 2>/dev/null)" || true
+  printf '%s' "${status_output}" | grep -q '"status":"unlocked"'
+}
+
+# Returns 0 if the user is not logged in at all.
+is_unauthenticated() {
+  local status_output
+  status_output="$("${BW_REAL_BINARY}" status 2>/dev/null)" || true
+  printf '%s' "${status_output}" | grep -q '"status":"unauthenticated"'
+}
+
+is_passthrough_command() {
+  local cmd="$1"
+  local c
+  for c in ${PASSTHROUGH_COMMANDS}; do
+    [[ "${cmd}" == "${c}" ]] && return 0
+  done
+  return 1
+}
+
+# Prompts for the master password (up to 3 attempts), unlocks the vault,
+# writes the new Session Token to the Session File, and prints the token.
+prompt_unlock() {
+  local attempts=0
+  local max_attempts=3
+
+  while (( attempts < max_attempts )); do
+    (( attempts++ )) || true
+
+    local BW_MASTER_PASSWORD
+    printf 'Bitwarden master password: ' >/dev/tty
+    read -rs BW_MASTER_PASSWORD </dev/tty
+    printf '\n' >/dev/tty
+
+    local token
+    if token="$(BW_MASTER_PASSWORD="${BW_MASTER_PASSWORD}" \
+        "${BW_REAL_BINARY}" unlock --passwordenv BW_MASTER_PASSWORD --raw 2>/dev/tty)"; then
+      if [[ -n "${token}" ]]; then
+        write_session_token "${token}"
+        printf '%s' "${token}"
+        return 0
+      fi
+    fi
+
+    if (( attempts < max_attempts )); then
+      printf '❌ Incorrect password, try again.\n' >/dev/tty
+    fi
+  done
+
+  printf '❌ bw: unlock failed after %d attempts\n' "${max_attempts}" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Determine the subcommand (first non-flag argument)
+# ---------------------------------------------------------------------------
+
+subcommand=""
+for arg in "$@"; do
+  case "${arg}" in
+    --*|-h|-v) continue ;;
+    *) subcommand="${arg}"; break ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Intercept lock / logout: run real command first, then delete Session File
+# ---------------------------------------------------------------------------
+
+if [[ "${subcommand}" == "lock" || "${subcommand}" == "logout" ]]; then
+  "${BW_REAL_BINARY}" "$@" || true
+  exit_code=$?
+  delete_session_file
+  exit "${exit_code}"
+fi
+
+# ---------------------------------------------------------------------------
+# Passthrough: commands that never need a session token
+# ---------------------------------------------------------------------------
+
+if [[ -z "${subcommand}" ]] || is_passthrough_command "${subcommand}"; then
+  exec "${BW_REAL_BINARY}" "$@"
+fi
+
+# Handle bare --version / --help flags with no subcommand detected above
+case "${subcommand}" in
+  --version|-v|--help|-h)
+    exec "${BW_REAL_BINARY}" "$@"
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# All other commands: ensure an unlocked session
+# ---------------------------------------------------------------------------
+
+# Reject early if the user hasn't logged in at all
+if is_unauthenticated; then
+  printf 'bw: not logged in — run '\''bw login'\'' in a terminal first\n' >&2
+  exit 1
+fi
+
+token=""
+if stored_token="$(read_session_token 2>/dev/null)" && [[ -n "${stored_token}" ]]; then
+  if validate_token "${stored_token}"; then
+    token="${stored_token}"
+  fi
+fi
+
+if [[ -z "${token}" ]]; then
+  # Need to unlock — require an interactive terminal
+  if ! { true; } </dev/tty 2>/dev/null; then
+    printf 'bw: vault is locked and no interactive terminal available — unlock in a terminal first\n' >&2
+    exit 1
+  fi
+
+  token="$(prompt_unlock)" || exit 1
+fi
+
+exec "${BW_REAL_BINARY}" --session "${token}" "$@"

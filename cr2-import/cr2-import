@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+#
+# cr2-import - convert Canon CR2 raw photos to timestamp-named JPGs
+# See README.md for the full workflow.
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+DEFAULT_QUALITY=92
+START_TIME="$SECONDS"
+
+format_duration() {
+  local total_seconds="$1"
+  local mins=$(( total_seconds / 60 ))
+  local secs=$(( total_seconds % 60 ))
+  if [[ $mins -gt 0 ]]; then
+    printf '%dm %ds' "$mins" "$secs"
+  else
+    printf '%ds' "$secs"
+  fi
+}
+
+usage() {
+  cat <<EOF
+$SCRIPT_NAME - convert Canon CR2 raw photos to timestamp-named JPGs
+
+USAGE:
+  $SCRIPT_NAME [OPTIONS] [FOLDER]
+
+  FOLDER   Directory containing .CR2 files to process. Defaults to the
+           current working directory if omitted. Not recursive -- only
+           .CR2 files directly in FOLDER are processed.
+
+OPTIONS:
+  -q, --quality NUM   JPEG output quality, 1-100 (default: $DEFAULT_QUALITY)
+  -h, --help          Show this help and exit
+
+WHAT IT DOES:
+  1. Converts every *.CR2 in FOLDER to a JPG in FOLDER/converted/,
+     using rawtherapee-cli (a true raw demosaic, not an embedded
+     preview extract).
+  2. Renames each converted JPG to:
+       YY-MM-dd HH-mm-ss <original CR2 filename>.jpg
+     using the CR2's EXIF DateTimeOriginal (the moment the shutter
+     fired), not the file's modification time.
+
+  The original .CR2 files in FOLDER are never modified, renamed, or
+  moved. Re-running is safe: delete FOLDER/converted and run again.
+
+EXAMPLES:
+  cd ~/Pictures/2026-06-family-outing && $SCRIPT_NAME
+  $SCRIPT_NAME -q 97 ~/Pictures/2026-06-family-outing
+
+REQUIRES (Ubuntu/apt):
+  exiftool        -- apt package: libimage-exiftool-perl
+  rawtherapee-cli -- apt package: rawtherapee
+  Missing tools trigger an offer to install them automatically.
+
+See README.md for the recommended pre-step: culling picks straight off
+a memory card with Geeqie before running this script.
+EOF
+}
+
+QUALITY="$DEFAULT_QUALITY"
+FOLDER="."
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -q|--quality)
+      QUALITY="${2:-}"
+      if [[ -z "$QUALITY" ]]; then
+        echo "Error: -q/--quality requires a value (1-100)." >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      FOLDER="$1"
+      shift
+      ;;
+  esac
+done
+
+# --- dependency check ------------------------------------------------------
+
+declare -A REQUIRED_PKGS=(
+  [exiftool]="libimage-exiftool-perl"
+  [rawtherapee-cli]="rawtherapee"
+)
+
+missing_pkgs=()
+for bin in "${!REQUIRED_PKGS[@]}"; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    missing_pkgs+=("${REQUIRED_PKGS[$bin]}")
+  fi
+done
+
+if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
+  mapfile -t missing_pkgs < <(printf '%s\n' "${missing_pkgs[@]}" | sort -u)
+  echo "Missing required tool(s). Install with:" >&2
+  echo "  sudo apt update && sudo apt install ${missing_pkgs[*]}" >&2
+  read -r -p "Install now? [y/N] " reply
+  if [[ "$reply" =~ ^[Yy]$ ]]; then
+    sudo apt update && sudo apt install -y "${missing_pkgs[@]}"
+  else
+    echo "Aborting: required tools not installed." >&2
+    exit 1
+  fi
+fi
+
+# --- validate folder and input ----------------------------------------------
+
+if [[ ! -d "$FOLDER" ]]; then
+  echo "Error: '$FOLDER' is not a directory." >&2
+  exit 1
+fi
+
+shopt -s nullglob nocaseglob
+cr2_files=("$FOLDER"/*.CR2)
+shopt -u nocaseglob nullglob
+
+if [[ ${#cr2_files[@]} -eq 0 ]]; then
+  echo "No .CR2 files found directly in '$FOLDER'." >&2
+  exit 1
+fi
+
+OUT_DIR="$FOLDER/converted"
+mkdir -p "$OUT_DIR"
+
+# --- progress bar helper -----------------------------------------------------
+
+BAR_WIDTH=30
+
+progress_bar() {
+  local current="$1" total="$2" label="$3"
+  local filled=$(( current * BAR_WIDTH / total ))
+  local empty=$(( BAR_WIDTH - filled ))
+  local bar
+  bar="$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' "$empty" '' | tr ' ' '-')"
+  if [[ -t 1 ]]; then
+    printf '\r[%s] %d/%d  %s\033[K' "$bar" "$current" "$total" "$label"
+  else
+    printf '  [%d/%d] %s\n' "$current" "$total" "$label"
+  fi
+}
+
+end_progress() {
+  [[ -t 1 ]] && printf '\n'
+}
+
+total=${#cr2_files[@]}
+
+# --- convert -----------------------------------------------------------------
+
+echo "Step 1/2: Converting $total CR2 file(s) to JPG (quality $QUALITY)"
+
+rt_log="$(mktemp)"
+
+i=0
+while IFS= read -r line; do
+  if [[ "$line" == "Processing: "* ]]; then
+    i=$((i + 1))
+    progress_bar "$i" "$total" "$(basename "${line#Processing: }")"
+  fi
+done < <(stdbuf -oL rawtherapee-cli -o "$OUT_DIR" -j"$QUALITY" -Y -c "${cr2_files[@]}" 2>&1 | tee "$rt_log")
+end_progress
+
+converted=0
+for cr2 in "${cr2_files[@]}"; do
+  base="$(basename "$cr2")"
+  stem="${base%.*}"
+  [[ -f "$OUT_DIR/$stem.jpg" ]] && converted=$((converted + 1))
+done
+failed=$((total - converted))
+echo "Converted $converted/$total ($failed failed)."
+if [[ $failed -gt 0 ]]; then
+  echo "  see full rawtherapee-cli log: $rt_log" >&2
+else
+  rm -f "$rt_log"
+fi
+
+# --- rename by capture time ---------------------------------------------------
+
+echo "Step 2/2: Renaming converted JPGs by capture time"
+renamed=0
+skipped=0
+i=0
+
+for cr2 in "${cr2_files[@]}"; do
+  i=$((i + 1))
+  base="$(basename "$cr2")"
+  stem="${base%.*}"
+  jpg="$OUT_DIR/$stem.jpg"
+  progress_bar "$i" "$total" "$base"
+
+  if [[ ! -f "$jpg" ]]; then
+    end_progress
+    echo "  skip: no converted output found for $base" >&2
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  ts="$(exiftool -DateTimeOriginal -d '%y-%m-%d %H-%M-%S' -s3 "$cr2")"
+  if [[ -z "$ts" ]]; then
+    end_progress
+    echo "  skip: no DateTimeOriginal in $base, leaving '$stem.jpg' as-is" >&2
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  new_name="$ts $stem.jpg"
+  mv -n "$jpg" "$OUT_DIR/$new_name"
+  renamed=$((renamed + 1))
+done
+end_progress
+
+elapsed=$((SECONDS - START_TIME))
+echo "Done. $renamed renamed, $skipped skipped. Output: $OUT_DIR (took $(format_duration "$elapsed"))"
